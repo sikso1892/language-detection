@@ -1,12 +1,8 @@
-from sklearn.model_selection import KFold
-from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments
-from sklearn.preprocessing import LabelEncoder
+import numpy as np
 import torch
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments
 from torch.utils.data import TensorDataset, DataLoader
-
-# 초기 설정
-K = 5
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+from sklearn.model_selection import KFold
 
 # 데이터 및 레이블 로딩
 with open("data/wili-2018/x_train.txt", "r", encoding="utf-8") as f:
@@ -15,83 +11,95 @@ with open("data/wili-2018/x_train.txt", "r", encoding="utf-8") as f:
 with open("data/wili-2018/y_train.txt", "r", encoding="utf-8") as f:
     labels = f.readlines()
 
-label_encoder = LabelEncoder()
-encoded_labels = label_encoder.fit_transform(labels)
+# 데이터와 레이블을 함께 100분의 1로 샘플링
+# random_state = np.random.RandomState(seed=2023)
+# sampled_indexes = np.random.choice(len(texts), size=len(texts) // 100, replace=False)
 
-# 토크나이저 및 모델 초기화
-tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-multilingual-cased')
+# texts = np.array(texts)
+# labels = np.array(labels)
 
-# 데이터 토큰화
-encoded_texts = tokenizer(texts, padding=True, truncation=True, return_tensors="pt", max_length=256)
-input_ids, attention_masks = encoded_texts["input_ids"], encoded_texts["attention_mask"]
+# texts = texts[sampled_indexes]
+# labels = labels[sampled_indexes]
 
-# K-fold 시작
-kf = KFold(n_splits=K)
+import random
+# 데이터와 레이블을 함께 100분의 1로 샘플링
+sampled_indexes = random.sample(range(len(texts)), len(texts) // 1000)
+texts = [texts[i] for i in sampled_indexes]
+labels = [labels[i] for i in sampled_indexes]
+
+unique_labels = list(set(labels))
+label_to_id = {label: id for id, label in enumerate(unique_labels)}
+
+labels = [label_to_id[label] for label in labels]
+
+tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-multilingual-cased")
+encodings = tokenizer(texts, truncation=True, padding=True, max_length=128)
+
+input_ids = torch.tensor(encodings['input_ids'])
+attention_masks = torch.tensor(encodings['attention_mask'])
+label_tensors = torch.tensor(labels)
+
+dataset = TensorDataset(input_ids, attention_masks, label_tensors)
+
+# 데이터 콜레이터 정의
+def collate_fn(batch):
+    input_ids = torch.stack([item[0] for item in batch])
+    attention_masks = torch.stack([item[1] for item in batch])
+    labels = torch.stack([item[2] for item in batch])
+    return {"input_ids": input_ids, "attention_mask": attention_masks, "labels": labels}
+
+kfold = KFold(n_splits=5, shuffle=True, random_state=42)
 fold_models = []
 
-for fold, (train_idx, val_idx) in enumerate(kf.split(input_ids)):
-    print(f"Training Fold {fold + 1}")
+for fold, (train_ids, val_ids) in enumerate(kfold.split(dataset)):
+    print(f"Training fold {fold + 1}")
 
-    train_inputs = input_ids[train_idx].to(device)
-    val_inputs = input_ids[val_idx].to(device)
-    train_labels = torch.tensor(encoded_labels[train_idx]).to(device)
-    val_labels = torch.tensor(encoded_labels[val_idx]).to(device)
-    train_masks = attention_masks[train_idx].to(device)
-    val_masks = attention_masks[val_idx].to(device)
+    train_dataset = torch.utils.data.Subset(dataset, train_ids)
+    eval_dataset = torch.utils.data.Subset(dataset, val_ids)
 
-    # 모델 정의 및 GPU로 이동
-    model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-multilingual-cased', num_labels=len(label_encoder.classes_)).to(device)
-
-    # Trainer 및 TrainingArguments 설정
+    model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-multilingual-cased", num_labels=len(unique_labels))
+    
     training_args = TrainingArguments(
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        num_train_epochs=3,
-        logging_dir=f'./logs/fold_{fold}',
+        output_dir=f'./results_fold_{fold}',
         evaluation_strategy="steps",
-        save_strategy="steps",
-        logging_steps=500,
-        save_steps=500,
-        push_to_hub=False,
-        output_dir=f'./results/fold_{fold}'
+        eval_steps=500,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=16,
+        num_train_epochs=3,
+        save_steps=1000,
+        logging_dir=f'./logs_fold_{fold}',
     )
-
-    train_dataset = TensorDataset(train_inputs, train_masks, train_labels)
-    val_dataset = TensorDataset(val_inputs, val_masks, val_labels)
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=val_dataset,
+        eval_dataset=eval_dataset,
+        data_collator=collate_fn  # 콜레이터 추가
     )
 
-    # 훈련 시작
     trainer.train()
     
-    # 모델 저장
-    model_path = f'./model_fold_{fold}'
-    model.save_pretrained(model_path)
-    fold_models.append(model_path)
+    fold_models.append(model)
 
-# 예측 시
-def ensemble_predict(models, input_ids, attention_mask):
+# 각 모델을 사용하여 앙상블 기반의 추론을 수행합니다.
+def ensemble_predict(models, input_ids, attention_masks):
     all_predictions = []
+    
+    for model in models:
+        with torch.no_grad():
+            outputs = model(input_ids, attention_mask=attention_masks)
+            predictions = torch.argmax(outputs.logits, dim=-1)
+            all_predictions.append(predictions)
+    
+    all_predictions = torch.stack(all_predictions)
+    final_predictions = torch.mode(all_predictions, dim=0).values
+    
+    return final_predictions
 
-    with torch.no_grad():
-        for model_path in models:
-            model = DistilBertForSequenceClassification.from_pretrained(model_path).to(device)
-            outputs = model(input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            all_predictions.append(logits)
+# 예시로 첫 번째 폴드의 검증 데이터를 사용하여 추론을 진행합니다.
+input_ids, attention_masks, true_labels = eval_dataset[:]
+predictions = ensemble_predict(fold_models, input_ids, attention_masks)
+accuracy = (predictions == true_labels).float().mean().item()
 
-    # 모든 모델의 결과를 합산
-    avg_predictions = torch.mean(torch.stack(all_predictions), dim=0)
-    return torch.argmax(avg_predictions, dim=1)
-
-# 예시 예측
-input_text = ["Example text 1", "Example text 2"]
-encoded = tokenizer(input_text, padding=True, truncation=True, return_tensors="pt", max_length=256)
-input_ids, attention_mask = encoded["input_ids"].to(device), encoded["attention_mask"].to(device)
-predictions = ensemble_predict(fold_models, input_ids, attention_mask)
-print(predictions)
+print(f"Ensemble accuracy: {accuracy * 100:.2f}%")

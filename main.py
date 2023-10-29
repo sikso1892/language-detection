@@ -58,7 +58,7 @@ class LanguageModel(torch.nn.Module):
         super(LanguageModel, self).__init__()
         self.embedding = torch.nn.Embedding(vocab_size, embed_size)
         
-        encoder_layers = TransformerEncoderLayer(embed_size, 8)
+        encoder_layers = TransformerEncoderLayer(embed_size, 8, )
         self.transformer_encoder = TransformerEncoder(encoder_layers, num_layers=6)
         
         self.fc = Linear(embed_size, num_languages)
@@ -188,7 +188,7 @@ def main():
         optimizer = Adam(model.parameters())
         loss_function = CrossEntropyLoss().to(device)
         
-        for epoch in range(NUM_EPOCHS):
+        for epoch in tqdm(range(NUM_EPOCHS), desc="Epochs"):
             train_loss = train_one_epoch(model, train_data_fold, train_labels_fold, optimizer, loss_function, device)
             val_loss = validate(model, val_data_fold, val_labels_fold, loss_function, device)
             
